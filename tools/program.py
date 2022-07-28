@@ -32,7 +32,8 @@ from ppocr.utils.save_load import save_model
 from ppocr.utils.utility import print_dict, AverageMeter
 from ppocr.utils.logging import get_logger
 from ppocr.utils.loggers import VDLLogger, WandbLogger, Loggers
-from ppocr.utils import profiler
+# from ppocr.utils import profiler
+import paddle.profiler as profiler
 from ppocr.data import build_dataloader
 
 
@@ -154,6 +155,23 @@ def check_xpu(use_xpu):
     except Exception as e:
         pass
 
+def check_mlu(use_mlu):
+    """
+    Log error and exit when set use_mlu=true in paddlepaddle
+    cpu/gpu version.
+    """
+    err = "Config use_mlu cannot be set as true while you are " \
+          "using paddlepaddle cpu/gpu version ! \nPlease try: \n" \
+          "\t1. Install paddlepaddle-xpu to run model on XPU \n" \
+          "\t2. Set use_mlu as false in config file to run " \
+          "model on CPU/GPU"
+
+    try:
+        if use_mlu and not paddle.is_compiled_with_mlu():
+            print(err)
+            sys.exit(1)
+    except Exception as e:
+        pass
 
 def train(config,
           train_dataloader,
@@ -168,7 +186,8 @@ def train(config,
           pre_best_model_dict,
           logger,
           log_writer=None,
-          scaler=None):
+          scaler=None,
+          use_profiler=False):
     cal_metric_during_train = config['Global'].get('cal_metric_during_train',
                                                    False)
     calc_epoch_interval = config['Global'].get('calc_epoch_interval', 1)
@@ -234,6 +253,14 @@ def train(config,
     max_iter = len(train_dataloader) - 1 if platform.system(
     ) == "Windows" else len(train_dataloader)
 
+    if use_profiler:
+        prof = profiler.Profiler(
+          targets=[profiler.ProfilerTarget.CPU, profiler.ProfilerTarget.MLU],
+          scheduler=(15, 20),
+          on_trace_ready=profiler.export_chrome_tracing('./profiler_bert_demo_mlu')
+        )
+        prof.start()
+
     for epoch in range(start_epoch, epoch_num + 1):
         if train_dataloader.dataset.need_reset:
             train_dataloader = build_dataloader(
@@ -241,7 +268,7 @@ def train(config,
             max_iter = len(train_dataloader) - 1 if platform.system(
             ) == "Windows" else len(train_dataloader)
         for idx, batch in enumerate(train_dataloader):
-            profiler.add_profiler_step(profiler_options)
+            # profiler.add_profiler_step(profiler_options)
             train_reader_cost += time.time() - reader_start
             if idx >= max_iter:
                 break
@@ -276,6 +303,9 @@ def train(config,
                 avg_loss.backward()
                 optimizer.step()
             optimizer.clear_grad()
+
+            if use_profiler:
+                prof.step()
 
             if cal_metric_during_train and epoch % calc_epoch_interval == 0:  # only rec and cls need
                 batch = [item.numpy() for item in batch]
@@ -385,6 +415,11 @@ def train(config,
                     log_writer.log_model(is_best=True, prefix="best_accuracy", metadata=best_model_dict)
 
             reader_start = time.time()
+
+            if use_profiler and global_step > 25:
+                prof.stop()
+                sys.exit(0)
+
         if dist.get_rank() == 0:
             save_model(
                 model,
@@ -561,6 +596,12 @@ def preprocess(is_train=False):
         use_xpu = config['Global']['use_xpu']
     check_xpu(use_xpu)
 
+    # check if set use_mlu=True in paddlepaddle cpu/gpu/xpu version
+    use_mlu = False
+    if 'use_mlu' in config['Global']:
+        use_mlu = config['Global']['use_mlu']
+    check_mlu(use_mlu)
+
     alg = config['Architecture']['algorithm']
     assert alg in [
         'EAST', 'DB', 'SAST', 'Rosetta', 'CRNN', 'STARNet', 'RARE', 'SRN',
@@ -575,6 +616,8 @@ def preprocess(is_train=False):
                                  .dev_id) if use_gpu else 'cpu'
     check_device(use_gpu, use_xpu)
 
+    if use_mlu:
+        device = 'mlu:{0}'.format(os.getenv('FLAGS_selected_mlus', 0))
     device = paddle.set_device(device)
 
     config['Global']['distributed'] = dist.get_world_size() != 1
