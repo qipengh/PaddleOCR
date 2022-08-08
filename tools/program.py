@@ -245,9 +245,11 @@ def train(config,
         'start_epoch'] if 'start_epoch' in best_model_dict else 1
 
     total_samples = 0
+    last_print_step = 0
     train_reader_cost = 0.0
     train_batch_cost = 0.0
     reader_start = time.time()
+    eta_time = time.time()
     eta_meter = AverageMeter()
 
     max_iter = len(train_dataloader) - 1 if platform.system(
@@ -262,6 +264,8 @@ def train(config,
         prof.start()
 
     for epoch in range(start_epoch, epoch_num + 1):
+        is_first_step = True
+        reader_start = time.time()
         if train_dataloader.dataset.need_reset:
             train_dataloader = build_dataloader(
                 config, 'Train', device, logger, seed=epoch)
@@ -324,7 +328,10 @@ def train(config,
 
             train_batch_time = time.time() - reader_start
             train_batch_cost += train_batch_time
-            eta_meter.update(train_batch_time)
+            # eta_meter.update(train_batch_time)
+            eta_time = time.time() - eta_time
+            eta_meter.update(eta_time)
+            eta_time = time.time()
             global_step += 1
             total_samples += len(images)
 
@@ -342,22 +349,25 @@ def train(config,
 
             if dist.get_rank() == 0 and (
                 (global_step > 0 and global_step % print_batch_step == 0) or
-                (idx >= len(train_dataloader) - 1)):
+                (idx >= len(train_dataloader) - 1) or is_first_step):
                 logs = train_stats.log()
+                actual_run_step = global_step - last_print_step
 
                 eta_sec = ((epoch_num + 1 - epoch) * \
                     len(train_dataloader) - idx - 1) * eta_meter.avg
                 eta_sec_format = str(datetime.timedelta(seconds=int(eta_sec)))
-                strs = 'epoch: [{}/{}], global_step: {}, {}, avg_reader_cost: ' \
+                strs = 'epoch: [{}/{}], global_step: {}, run_step: {}, {}, avg_reader_cost: ' \
                        '{:.5f} s, avg_batch_cost: {:.5f} s, avg_samples: {}, ' \
                        'ips: {:.5f} samples/s, eta: {}'.format(
-                    epoch, epoch_num, global_step, logs,
-                    train_reader_cost / print_batch_step,
-                    train_batch_cost / print_batch_step,
-                    total_samples / print_batch_step,
+                    epoch, epoch_num, global_step, actual_run_step, logs,
+                    train_reader_cost / actual_run_step,
+                    train_batch_cost / actual_run_step,
+                    total_samples / actual_run_step,
                     total_samples / train_batch_cost, eta_sec_format)
                 logger.info(strs)
 
+                is_first_step = False
+                last_print_step = global_step
                 total_samples = 0
                 train_reader_cost = 0.0
                 train_batch_cost = 0.0
